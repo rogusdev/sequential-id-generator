@@ -83,6 +83,12 @@ fn clear_expired (
         expires.remove(id);
         availables.push_back(*id);
     }
+    // TODO: use https://doc.rust-lang.org/stable/std/collections/struct.BTreeMap.html#method.extract_if
+    // let count_old = availables.len();
+    // for (id, expire) in expires.extract_if(|&id, &mut expire| expire < now) {
+    //     availables.push_back(id);
+    // }
+    // availables.len() - count_old
     expireds.len()
 }
 
