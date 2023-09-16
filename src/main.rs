@@ -52,6 +52,13 @@ fn env_var_parse<T: std::str::FromStr> (name: &str, default: T) -> T {
     }
 }
 
+fn json_success (id: usize, exp: i64) -> Json<Value> {
+    Json(json!({
+        "id": id,
+        "exp": exp,
+    }))
+}
+
 fn json_error (code: usize) -> Json<Value> {
     Json(json!({
         "error": {
@@ -98,10 +105,7 @@ fn get_next_impl (state: AppState) -> Result<(usize, i64), usize> {
 
 async fn get_next (State(state): State<AppState>) -> Json<Value> {
     match get_next_impl(state) {
-        Ok((id_next, expiry)) => Json(json!({
-            "id": id_next,
-            "exp": expiry,
-        })),
+        Ok((id_next, expiry)) => json_success(id_next, expiry),
         Err(code) => json_error(code)
     }
 }
@@ -127,10 +131,7 @@ fn get_heartbeat_impl (id: usize, state: AppState) -> Result<i64, usize> {
 
 async fn get_heartbeat (Path(id): Path<usize>, State(state): State<AppState>) -> Json<Value> {
     match get_heartbeat_impl(id, state) {
-        Ok(expiry) => Json(json!({
-            "id": id,
-            "exp": expiry,
-        })),
+        Ok(expiry) => json_success(id, expiry),
         Err(code) => json_error(code)
     }
 }
