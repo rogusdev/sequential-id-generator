@@ -1,5 +1,9 @@
 
-use std::{env, collections::btree_map::Keys};
+mod time_provider;
+
+use time_provider::{TimeProvider, SystemTimeProvider};
+
+use std::env;
 
 use axum::{
 	routing::get,
@@ -10,15 +14,12 @@ use axum::{
 
 use serde_json::{Value, json};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[macro_use]
-extern crate lazy_static;
+use lazy_static::lazy_static;
 
 
-const DEFAULT_PORT: usize = 3000;
+const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_MAX: usize = 65535;
 const DEFAULT_TIMEOUT: i64 = 3000;
 
@@ -36,70 +37,18 @@ lazy_static! {
 }
 
 
-pub trait TimeProvider {
-    fn unix_ts_ms (&self) -> i64;
-}
-
-#[derive(Debug, Clone)]
-pub struct SystemTimeProvider {
-}
-
-impl TimeProvider for SystemTimeProvider {
-    fn unix_ts_ms (&self) -> i64 {
-        let dur = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-
-        ((dur.as_secs() * 1_000) + dur.subsec_millis() as u64) as i64
-    }
-}
-
-
 #[derive(Clone)]
 struct AppState {
-    id_max: usize,
-    id_lowest_available: usize,
-    ids: BTreeMap<usize, i64>,
     timeout: i64,
-    //time_provider: impl TimeProvider,
-    time_provider: SystemTimeProvider,
+    expires: BTreeMap<usize, i64>,
+    availables: VecDeque<usize>,
+    time_provider: Box<dyn TimeProvider>,
 }
 
 fn env_var_parse<T: std::str::FromStr> (name: &str, default: T) -> T {
     match env::var(name) {
         Ok(s) => s.parse::<T>().unwrap_or(default),
         _ => default
-    }
-}
-
-fn find_lowest_available_key<T> (mut keys: Keys<usize, T>, from: usize, max: usize) -> Option<usize> {
-    // TODO: actually want to switch to some sort of LRU of available ids
-    //  perhaps pre-populate entire collection and always pick lowest (oldest) expiry for unused id
-    //  i.e. keep a cursor into position after the last position used, and wrap around as needed
-    //  skipping over any still in use ids
-    // Going in sequence should always make oldest next?...
-    //  NO because
-    // Instead should have 2 lists: 1. BTreeSet of available ids, 2. BTreeMap of ids to expirations
-    //  then move keys back and forth as ids expire or get renewed -- also using oldest
-
-    // https://stackoverflow.com/questions/42052065/how-can-i-introduce-a-copied-variable-as-mutable-in-a-if-let-statement/42052916#42052916
-    // https://stackoverflow.com/questions/31012923/what-is-the-difference-between-copy-and-clone
-    let mut key_next = 0;
-    if let Some(key_prev) = keys.next().copied() {
-        key_next = key_prev + 1;
-        for &key in keys {
-            if key > key_next && key > from {
-                return Some(key_next)
-            }
-            key_next = key;
-        }
-    }
-
-    key_next = from.max(key_next + 1);
-    if key_next <= max {
-        Some(key_next)
-    } else {
-        None
     }
 }
 
@@ -112,34 +61,36 @@ fn json_error (code: usize) -> Json<Value> {
     }))
 }
 
-async fn get_next (State(mut state): State<AppState>) -> Json<Value> {
-    let opt_lowest_available_key = find_lowest_available_key(
-        state.ids.keys(),
-        state.id_lowest_available,
-        state.id_max
-    );
-
-    if let Some(id_lowest_available) = opt_lowest_available_key {
-        state.id_lowest_available = id_lowest_available + 1;
+fn get_next_impl (mut state: AppState) -> Result<(usize, i64), usize> {
+    if let Some(id_next) = state.availables.pop_front() {
         let expiry = state.time_provider.unix_ts_ms() + state.timeout;
-        state.ids.insert(id_lowest_available, expiry);
-        Json(json!({
-            "id": id_lowest_available
-        }))
+        state.expires.insert(id_next, expiry);
+        Ok((id_next, expiry))
     } else {
-        json_error(ERROR_CODE_NO_ID_AVAILBLE)
+        Err(ERROR_CODE_NO_ID_AVAILBLE)
+    }
+}
+
+async fn get_next (State(state): State<AppState>) -> Json<Value> {
+    match get_next_impl(state) {
+        Ok((id_next, expiry)) => Json(json!({
+            "id": id_next,
+            "exp": expiry,
+        })),
+        Err(code) => json_error(code)
     }
 }
 
 fn get_heartbeat_impl (id: usize, mut state: AppState) -> Result<i64, usize> {
-    if let Some(&expiry) = state.ids.get(&id) {
+    if let Some(&expiry) = state.expires.get(&id) {
         let now = state.time_provider.unix_ts_ms();
         if expiry > now {
             let expiry = now + state.timeout;
-            state.ids.insert(id, expiry);
-            Ok(now)
+            state.expires.insert(id, expiry);
+            Ok(expiry)
         } else {
-            state.ids.remove(&id);
+            state.expires.remove(&id);
+            state.availables.push_back(id);
             // TODO: warn loudly! this means it potentially used a shared id for some period
             Err(ERROR_CODE_ID_EXPIRED)
         }
@@ -154,9 +105,7 @@ async fn get_heartbeat (Path(id): Path<usize>, State(state): State<AppState>) ->
             "id": id,
             "exp": expiry,
         })),
-        Err(code) => {
-            json_error(code)
-        }
+        Err(code) => json_error(code)
     }
 }
 
@@ -168,11 +117,10 @@ async fn main() {
     let timeout = env_var_parse("TIMEOUT", DEFAULT_TIMEOUT);
 
     let state = AppState {
-        id_max,
-        id_lowest_available: 1,
-        ids: BTreeMap::new(),
         timeout,
-        time_provider: SystemTimeProvider {},
+        expires: BTreeMap::new(),
+        availables: VecDeque::from((0..id_max).collect::<Vec<usize>>()),
+        time_provider: Box::new(SystemTimeProvider {}),
     };
 
     let app = Router::new()
@@ -190,68 +138,130 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time_provider::FixedTimeProvider;
 
-    #[test]
-    fn find_lowest_available_key_empty () {
-        let data: Vec<(usize, i64)> = vec![];
-        let ids = data
-            .into_iter()
+    const TEST_TIMEOUT: i64 = 2000;
+
+    fn vec_to_btree<T: Ord, U> (v: Vec<(T, U)>) -> BTreeMap<T, U> {
+        v.into_iter()
             .map(|x| (x.0, x.1))
-            .collect::<BTreeMap<_, _>>();
-        for id_low in 1..6 {
-            let result = find_lowest_available_key(ids.keys(), id_low, 256);
-            assert_eq!(result, Some(id_low));
-        }
+            .collect::<BTreeMap<_, _>>()
     }
 
     #[test]
-    fn find_lowest_available_key_happy () {
-        let data = vec![
-            (1, 123),
-            (2, 456),
-        ];
-        let ids = data
-            .into_iter()
-            .map(|x| (x.0, x.1))
-            .collect::<BTreeMap<_, _>>();
-        for id_low in 1..6 {
-            let result = find_lowest_available_key(ids.keys(), id_low, 256);
-            assert_eq!(result, Some(if id_low <= 3 { 3 } else { id_low }));
-        }
+    fn get_heartbeat_impl_missing () {
+        let state = AppState {
+            timeout: TEST_TIMEOUT,
+            expires: BTreeMap::new(),
+            availables: VecDeque::from((0..3).collect::<Vec<usize>>()),
+            time_provider: Box::new(SystemTimeProvider {}),
+        };
+        let result = get_heartbeat_impl(1, state);
+        assert_eq!(result, Err(ERROR_CODE_ID_NONEXISTENT));
     }
 
     #[test]
-    fn find_lowest_available_key_skip () {
-        let data = vec![
-            (1, 123),
-            (3, 456),
-        ];
-        let ids = data
-            .into_iter()
-            .map(|x| (x.0, x.1))
-            .collect::<BTreeMap<_, _>>();
-        for id_low in 1..6 {
-            let result = find_lowest_available_key(ids.keys(), id_low, 256);
-            assert_eq!(result, Some(if id_low <= 2 { 2 } else if id_low <= 4 { 4 } else { id_low }));
-        }
+    fn get_heartbeat_impl_ok () {
+        let mut time_provider = FixedTimeProvider {
+            fixed_unix_ts_ms: 123,
+        };
+        let now = time_provider.unix_ts_ms();
+        let expires = vec_to_btree(vec![
+            (1, now + TEST_TIMEOUT),
+            (2, now + TEST_TIMEOUT),
+        ]);
+        time_provider.fixed_unix_ts_ms += TEST_TIMEOUT * 2;
+        let state = AppState {
+            timeout: TEST_TIMEOUT,
+            expires: BTreeMap::new(),
+            availables: VecDeque::from((0..3).collect::<Vec<usize>>()),
+            time_provider: Box::new(time_provider),
+        };
+        let result = get_heartbeat_impl(1, state);
+        assert_eq!(result, Ok(now + TEST_TIMEOUT));
     }
 
     #[test]
-    fn find_lowest_available_key_max () {
-        let data = vec![
-            (1, 123),
-            (2, 456),
-        ];
-        let ids = data
-            .into_iter()
-            .map(|x| (x.0, x.1))
-            .collect::<BTreeMap<_, _>>();
-        for id_low in 1..6 {
-            let result = find_lowest_available_key(ids.keys(), id_low, 2);
-            assert_eq!(result, None);
-
-            let result2 = find_lowest_available_key(ids.keys(), id_low, 3);
-            assert_eq!(result2, if id_low <= 3 { Some(3) } else { None });
-        }
+    fn get_heartbeat_impl_expired () {
+        let mut time_provider = FixedTimeProvider {
+            fixed_unix_ts_ms: 123,
+        };
+        let now = time_provider.unix_ts_ms();
+        let expires = vec_to_btree(vec![
+            (1, now + TEST_TIMEOUT),
+        ]);
+        time_provider.fixed_unix_ts_ms += TEST_TIMEOUT * 2;
+        let state = AppState {
+            timeout: TEST_TIMEOUT,
+            expires: BTreeMap::new(),
+            availables: VecDeque::from((0..3).collect::<Vec<usize>>()),
+            time_provider: Box::new(time_provider),
+        };
+        let result = get_heartbeat_impl(1, state);
+        assert_eq!(result, Ok(now + TEST_TIMEOUT));
     }
+
+    // #[test]
+    // fn get_next_empty () {
+    //     let data: Vec<(usize, i64)> = vec![];
+    //     let ids = data
+    //         .into_iter()
+    //         .map(|x| (x.0, x.1))
+    //         .collect::<BTreeMap<_, _>>();
+    //     for id_low in 1..6 {
+    //         let result = find_lowest_available_key(ids.keys(), id_low, 256);
+    //         assert_eq!(result, Some(id_low));
+    //     }
+    // }
+
+    // #[test]
+    // fn get_next_happy () {
+    //     let data = vec![
+    //         (1, 123),
+    //         (2, 456),
+    //     ];
+    //     let ids = data
+    //         .into_iter()
+    //         .map(|x| (x.0, x.1))
+    //         .collect::<BTreeMap<_, _>>();
+    //     for id_low in 1..6 {
+    //         let result = find_lowest_available_key(ids.keys(), id_low, 256);
+    //         assert_eq!(result, Some(if id_low <= 3 { 3 } else { id_low }));
+    //     }
+    // }
+
+    // #[test]
+    // fn get_next_skip () {
+    //     let data = vec![
+    //         (1, 123),
+    //         (3, 456),
+    //     ];
+    //     let ids = data
+    //         .into_iter()
+    //         .map(|x| (x.0, x.1))
+    //         .collect::<BTreeMap<_, _>>();
+    //     for id_low in 1..6 {
+    //         let result = find_lowest_available_key(ids.keys(), id_low, 256);
+    //         assert_eq!(result, Some(if id_low <= 2 { 2 } else if id_low <= 4 { 4 } else { id_low }));
+    //     }
+    // }
+
+    // #[test]
+    // fn get_next_max () {
+    //     let data = vec![
+    //         (1, 123),
+    //         (2, 456),
+    //     ];
+    //     let ids = data
+    //         .into_iter()
+    //         .map(|x| (x.0, x.1))
+    //         .collect::<BTreeMap<_, _>>();
+    //     for id_low in 1..6 {
+    //         let result = find_lowest_available_key(ids.keys(), id_low, 2);
+    //         assert_eq!(result, None);
+
+    //         let result2 = find_lowest_available_key(ids.keys(), id_low, 3);
+    //         assert_eq!(result2, if id_low <= 3 { Some(3) } else { None });
+    //     }
+    // }
 }
