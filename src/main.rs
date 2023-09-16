@@ -20,6 +20,7 @@ use lazy_static::lazy_static;
 
 const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_MAX: usize = 65535;
+const DEFAULT_MIN: usize = 1;
 const DEFAULT_TIMEOUT: i64 = 3000;
 
 const ERROR_CODE_NO_ID_AVAILBLE: usize = 1;
@@ -107,7 +108,6 @@ async fn get_next (State(state): State<AppState>) -> Json<Value> {
 
 fn get_heartbeat_impl (id: usize, state: AppState) -> Result<i64, usize> {
     let mut expires = state.expires.lock().expect("Poisoned get_heartbeat_impl expires mutex");
-    let mut availables = state.availables.lock().expect("Poisoned get_heartbeat_impl availables mutex");
 
     if let Some(&expiry) = expires.get(&id) {
         let now = state.time_provider.unix_ts_ms();
@@ -116,8 +116,7 @@ fn get_heartbeat_impl (id: usize, state: AppState) -> Result<i64, usize> {
             expires.insert(id, expiry);
             Ok(expiry)
         } else {
-            expires.remove(&id);
-            availables.push_back(id);
+            // Connecting client should take this error and request a new (next) id
             // TODO: warn loudly! this means it potentially used a shared id for some period
             Err(ERROR_CODE_ID_EXPIRED)
         }
@@ -141,12 +140,13 @@ async fn get_heartbeat (Path(id): Path<usize>, State(state): State<AppState>) ->
 async fn main() {
     let port = env_var_parse("PORT", DEFAULT_PORT);
     let id_max = env_var_parse("MAX", DEFAULT_MAX);
+    let id_min = env_var_parse("MIN", DEFAULT_MIN);
     let timeout = env_var_parse("TIMEOUT", DEFAULT_TIMEOUT);
 
     let state = AppState {
         timeout,
         expires: Arc::new(Mutex::new(BTreeMap::new())),
-        availables: Arc::new(Mutex::new(VecDeque::from((1..id_max).collect::<Vec<usize>>()))),
+        availables: Arc::new(Mutex::new(VecDeque::from((id_min..=id_max).collect::<Vec<usize>>()))),
         time_provider: Box::new(SystemTimeProvider {}),
     };
 
@@ -245,9 +245,15 @@ mod tests {
             &mut state.availables.lock().unwrap()
         );
         assert_eq!(result, 1);
+
         // NOTE: cannot set time_provider.fixed_unix_ts_ms without jumping through many more hoops
         // so cannot truly test time moving and ids expiring without significant refactoring for just that
         // main concern is that it impacts performance -- would have to replace Box with Arc<Mutex<...
+
+        // expires has removed the old entry
+        assert_eq!(*state.expires.lock().unwrap(), *vec_to_btree(vec![(2, now + TEST_TIMEOUT)]).lock().unwrap());
+        // and now the old id is at the end of the queue
+        assert_eq!(*state.availables.lock().unwrap(), VecDeque::from(vec![3,1]));
     }
 
     #[test]
@@ -301,10 +307,5 @@ mod tests {
         };
         let result = get_heartbeat_impl(1, state.clone());
         assert_eq!(result, Err(ERROR_CODE_ID_EXPIRED));
-
-        // expires has removed the previous entry
-        assert_eq!(*state.expires.lock().unwrap(), *vec_to_btree(vec![]).lock().unwrap());
-        // and now the old id is at the end of the queue
-        assert_eq!(*state.availables.lock().unwrap(), VecDeque::from(vec![2,1]));
     }
 }
