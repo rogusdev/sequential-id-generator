@@ -1,9 +1,10 @@
 
 mod time_provider;
-
 use time_provider::{TimeProvider, SystemTimeProvider};
 
 use std::env;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::{BTreeMap, VecDeque};
 
 use axum::{
 	routing::get,
@@ -13,8 +14,6 @@ use axum::{
 };
 
 use serde_json::{Value, json};
-
-use std::collections::{BTreeMap, VecDeque};
 
 use lazy_static::lazy_static;
 
@@ -40,8 +39,8 @@ lazy_static! {
 #[derive(Clone)]
 struct AppState {
     timeout: i64,
-    expires: BTreeMap<usize, i64>,
-    availables: VecDeque<usize>,
+    expires: Arc<Mutex<BTreeMap<usize, i64>>>,
+    availables: Arc<Mutex<VecDeque<usize>>>,
     time_provider: Box<dyn TimeProvider + Send + Sync>,
 }
 
@@ -61,34 +60,43 @@ fn json_error (code: usize) -> Json<Value> {
     }))
 }
 
-fn clear_expired (state: &mut AppState) -> usize {
+fn clear_expired (
+    now: i64,
+    expires: &mut MutexGuard<BTreeMap<usize, i64>>,
+    availables: &mut MutexGuard<VecDeque<usize>>
+) -> usize {
     let mut expireds = vec![];
-    let now = state.time_provider.unix_ts_ms();
-    for (&id, &expire) in state.expires.iter() {
+    for (&id, &expire) in expires.iter() {
         if expire < now {
             expireds.push(id);
         }
     }
-    for &id in expireds.iter() {
-        state.expires.remove(&id);
-        state.availables.push_back(id);
+    for id in expireds.iter() {
+        expires.remove(id);
+        availables.push_back(*id);
     }
     expireds.len()
 }
 
-fn get_next_impl (state: &mut AppState) -> Result<(usize, i64), usize> {
-    clear_expired(state);
-    if let Some(id_next) = state.availables.pop_front() {
-        let expiry = state.time_provider.unix_ts_ms() + state.timeout;
-        state.expires.insert(id_next, expiry);
+fn get_next_impl (state: AppState) -> Result<(usize, i64), usize> {
+    let mut expires = state.expires.lock().expect("Poisoned get_next_impl expires mutex");
+    let mut availables = state.availables.lock().expect("Poisoned get_next_impl availables mutex");
+
+    let now = state.time_provider.unix_ts_ms();
+    clear_expired(now, &mut expires, &mut availables);
+
+    if let Some(id_next) = availables.pop_front() {
+        let now = state.time_provider.unix_ts_ms();
+        let expiry = now + state.timeout;
+        expires.insert(id_next, expiry);
         Ok((id_next, expiry))
     } else {
         Err(ERROR_CODE_NO_ID_AVAILBLE)
     }
 }
 
-async fn get_next (State(mut state): State<AppState>) -> Json<Value> {
-    match get_next_impl(&mut state) {
+async fn get_next (State(state): State<AppState>) -> Json<Value> {
+    match get_next_impl(state) {
         Ok((id_next, expiry)) => Json(json!({
             "id": id_next,
             "exp": expiry,
@@ -97,16 +105,19 @@ async fn get_next (State(mut state): State<AppState>) -> Json<Value> {
     }
 }
 
-fn get_heartbeat_impl (id: usize, state: &mut AppState) -> Result<i64, usize> {
-    if let Some(&expiry) = state.expires.get(&id) {
+fn get_heartbeat_impl (id: usize, state: AppState) -> Result<i64, usize> {
+    let mut expires = state.expires.lock().expect("Poisoned get_heartbeat_impl expires mutex");
+    let mut availables = state.availables.lock().expect("Poisoned get_heartbeat_impl availables mutex");
+
+    if let Some(&expiry) = expires.get(&id) {
         let now = state.time_provider.unix_ts_ms();
         if expiry > now {
             let expiry = now + state.timeout;
-            state.expires.insert(id, expiry);
+            expires.insert(id, expiry);
             Ok(expiry)
         } else {
-            state.expires.remove(&id);
-            state.availables.push_back(id);
+            expires.remove(&id);
+            availables.push_back(id);
             // TODO: warn loudly! this means it potentially used a shared id for some period
             Err(ERROR_CODE_ID_EXPIRED)
         }
@@ -115,8 +126,8 @@ fn get_heartbeat_impl (id: usize, state: &mut AppState) -> Result<i64, usize> {
     }
 }
 
-async fn get_heartbeat (Path(id): Path<usize>, State(mut state): State<AppState>) -> Json<Value> {
-    match get_heartbeat_impl(id, &mut state) {
+async fn get_heartbeat (Path(id): Path<usize>, State(state): State<AppState>) -> Json<Value> {
+    match get_heartbeat_impl(id, state) {
         Ok(expiry) => Json(json!({
             "id": id,
             "exp": expiry,
@@ -134,8 +145,8 @@ async fn main() {
 
     let state = AppState {
         timeout,
-        expires: BTreeMap::new(),
-        availables: VecDeque::from((1..id_max).collect::<Vec<usize>>()),
+        expires: Arc::new(Mutex::new(BTreeMap::new())),
+        availables: Arc::new(Mutex::new(VecDeque::from((1..id_max).collect::<Vec<usize>>()))),
         time_provider: Box::new(SystemTimeProvider {}),
     };
 
@@ -153,15 +164,23 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
     use time_provider::{FixedTimeProvider, ZeroTimeProvider};
 
     const TEST_TIMEOUT: i64 = 2000;
 
-    fn vec_to_btree<T: Ord, U> (v: Vec<(T, U)>) -> BTreeMap<T, U> {
-        v.into_iter()
-            .map(|x| (x.0, x.1))
-            .collect::<BTreeMap<_, _>>()
+    fn vec_to_btree<T: Ord, U> (v: Vec<(T, U)>) -> Arc<Mutex<BTreeMap<T, U>>> {
+        Arc::new(Mutex::new(
+            v.into_iter()
+                .map(|x| (x.0, x.1))
+                .collect::<BTreeMap<_, _>>()
+        ))
+    }
+
+    fn availables_from_range (r: Range<usize>) -> Arc<Mutex<VecDeque<usize>>> {
+        Arc::new(Mutex::new(VecDeque::from(r.collect::<Vec<usize>>())))
     }
 
     #[test]
@@ -174,13 +193,13 @@ mod tests {
             (1, now + TEST_TIMEOUT),
             (2, now + TEST_TIMEOUT),
         ]);
-        let mut state = AppState {
+        let state = AppState {
             timeout: TEST_TIMEOUT,
             expires,
-            availables: VecDeque::from((3..3).collect::<Vec<usize>>()),
+            availables: availables_from_range(3..3),
             time_provider: Box::new(ZeroTimeProvider {}),
         };
-        let result = get_next_impl(&mut state);
+        let result = get_next_impl(state);
         assert_eq!(result, Err(ERROR_CODE_NO_ID_AVAILBLE));
     }
 
@@ -194,13 +213,13 @@ mod tests {
             (1, now + TEST_TIMEOUT),
             (2, now + TEST_TIMEOUT),
         ]);
-        let mut state = AppState {
+        let state = AppState {
             timeout: TEST_TIMEOUT,
             expires,
-            availables: VecDeque::from((3..4).collect::<Vec<usize>>()),
+            availables: availables_from_range(3..4),
             time_provider: Box::new(time_provider),
         };
-        let result = get_next_impl(&mut state);
+        let result = get_next_impl(state);
         assert_eq!(result, Ok((3, now + TEST_TIMEOUT)));
     }
 
@@ -214,27 +233,32 @@ mod tests {
             (1, now - TEST_TIMEOUT),
             (2, now + TEST_TIMEOUT),
         ]);
-        let mut state = AppState {
+        let state = AppState {
             timeout: TEST_TIMEOUT,
             expires,
-            availables: VecDeque::from((3..4).collect::<Vec<usize>>()),
+            availables: availables_from_range(3..4),
             time_provider: Box::new(time_provider),
         };
-        let result = clear_expired(&mut state);
+        let result = clear_expired(
+            now,
+            &mut state.expires.lock().unwrap(),
+            &mut state.availables.lock().unwrap()
+        );
         assert_eq!(result, 1);
         // NOTE: cannot set time_provider.fixed_unix_ts_ms without jumping through many more hoops
         // so cannot truly test time moving and ids expiring without significant refactoring for just that
+        // main concern is that it impacts performance -- would have to replace Box with Arc<Mutex<...
     }
 
     #[test]
     fn get_heartbeat_impl_missing () {
-        let mut state = AppState {
+        let state = AppState {
             timeout: TEST_TIMEOUT,
-            expires: BTreeMap::new(),
-            availables: VecDeque::from((1..3).collect::<Vec<usize>>()),
+            expires: Arc::new(Mutex::new(BTreeMap::new())),
+            availables: availables_from_range(1..3),
             time_provider: Box::new(SystemTimeProvider {}),
         };
-        let result = get_heartbeat_impl(1, &mut state);
+        let result = get_heartbeat_impl(1, state);
         assert_eq!(result, Err(ERROR_CODE_ID_NONEXISTENT));
     }
 
@@ -249,13 +273,13 @@ mod tests {
             (2, now + TEST_TIMEOUT),
         ]);
         time_provider.fixed_unix_ts_ms += TEST_TIMEOUT / 2;
-        let mut state = AppState {
+        let state = AppState {
             timeout: TEST_TIMEOUT,
             expires,
-            availables: VecDeque::from((3..3).collect::<Vec<usize>>()),
+            availables: availables_from_range(3..3),
             time_provider: Box::new(time_provider),
         };
-        let result = get_heartbeat_impl(1, &mut state);
+        let result = get_heartbeat_impl(1, state);
         assert_eq!(result, Ok(now + TEST_TIMEOUT + TEST_TIMEOUT / 2));
     }
 
@@ -269,18 +293,18 @@ mod tests {
             (1, now + TEST_TIMEOUT),
         ]);
         time_provider.fixed_unix_ts_ms += TEST_TIMEOUT * 2;
-        let mut state = AppState {
+        let state = AppState {
             timeout: TEST_TIMEOUT,
             expires,
-            availables: VecDeque::from((2..3).collect::<Vec<usize>>()),
+            availables: availables_from_range(2..3),
             time_provider: Box::new(time_provider),
         };
-        let result = get_heartbeat_impl(1, &mut state);
+        let result = get_heartbeat_impl(1, state.clone());
         assert_eq!(result, Err(ERROR_CODE_ID_EXPIRED));
 
         // expires has removed the previous entry
-        assert_eq!(state.expires, vec_to_btree(vec![]));
+        assert_eq!(*state.expires.lock().unwrap(), *vec_to_btree(vec![]).lock().unwrap());
         // and now the old id is at the end of the queue
-        assert_eq!(state.availables, VecDeque::from(vec![2,1]));
+        assert_eq!(*state.availables.lock().unwrap(), VecDeque::from(vec![2,1]));
     }
 }
