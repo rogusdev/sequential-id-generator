@@ -1,11 +1,16 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dyn_clone::{clone_trait_object, DynClone};
 
-pub trait TimeProvider {
+
+pub trait TimeProvider : DynClone {
     fn unix_ts_ms (&self) -> i64;
 }
 
+clone_trait_object!(TimeProvider); // only needed for Box, not Arc?
+
+#[derive(Debug, Clone)]
 pub struct SystemTimeProvider {
 }
 
@@ -22,6 +27,7 @@ impl TimeProvider for SystemTimeProvider {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct FixedTimeProvider {
     pub fixed_unix_ts_ms: i64,
 }
@@ -39,6 +45,7 @@ impl TimeProvider for FixedTimeProvider {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ZeroTimeProvider {
 }
 
