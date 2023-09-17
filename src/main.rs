@@ -36,13 +36,12 @@ lazy_static! {
     ].iter().copied().collect::<BTreeMap<_, _>>();
 }
 
-static SYSTEM_TIME_PROVIDER: SystemTimeProvider = SystemTimeProvider {};
-
-struct AppState<'a> {
+#[derive(Clone)]
+struct AppState {
     timeout: i64,
     expires: BTreeMap<usize, i64>,
     availables: VecDeque<usize>,
-    time_provider: &'a(dyn TimeProvider + Send + Sync),
+    time_provider: Box<dyn TimeProvider + Send + Sync>,
 }
 
 fn env_var_parse<T: std::str::FromStr> (name: &str, default: T) -> T {
@@ -102,7 +101,7 @@ fn get_next_impl (mut state: MutexGuard<AppState>) -> Result<(usize, i64), usize
     }
 }
 
-async fn get_next (State(state): State<Arc<Mutex<AppState<'_>>>>) -> Json<Value> {
+async fn get_next (State(state): State<Arc<Mutex<AppState>>>) -> Json<Value> {
     let state = state.lock().expect("Poisoned get_next_impl mutex");
     match get_next_impl(state) {
         Ok((id_next, expire)) => json_success(id_next, expire),
@@ -127,7 +126,7 @@ fn get_heartbeat_impl (id: usize, mut state: MutexGuard<AppState>) -> Result<i64
     }
 }
 
-async fn get_heartbeat (Path(id): Path<usize>, State(state): State<Arc<Mutex<AppState<'_>>>>) -> Json<Value> {
+async fn get_heartbeat (Path(id): Path<usize>, State(state): State<Arc<Mutex<AppState>>>) -> Json<Value> {
     let state = state.lock().expect("Poisoned get_heartbeat mutex");
     match get_heartbeat_impl(id, state) {
         Ok(expire) => json_success(id, expire),
@@ -147,7 +146,7 @@ async fn main() {
         timeout,
         expires: BTreeMap::new(),
         availables: VecDeque::from((id_min..=id_max).collect::<Vec<usize>>()),
-        time_provider: &SYSTEM_TIME_PROVIDER,
+        time_provider: Box::new(SystemTimeProvider {}),
     }));
 
     let app = Router::new()
@@ -202,7 +201,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             expires,
             availables: availables_from_range(3..3),
-            time_provider: &time_provider,
+            time_provider: Box::new(time_provider),
         }));
         let result = get_next_impl(state.lock().unwrap());
         assert_eq!(result, Err(ERROR_CODE_NO_ID_AVAILBLE));
@@ -222,7 +221,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             expires,
             availables: availables_from_range(3..4),
-            time_provider: &time_provider,
+            time_provider: Box::new(time_provider),
         }));
         let result = get_next_impl(state.lock().unwrap());
         assert_eq!(result, Ok((3, now + TEST_TIMEOUT)));
@@ -243,7 +242,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             expires,
             availables: availables_from_range(3..4),
-            time_provider: &time_provider_state,
+            time_provider: Box::new(time_provider_state),
         }));
 
         {
@@ -281,7 +280,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             expires: BTreeMap::new(),
             availables: availables_from_range(1..3),
-            time_provider: &time_provider,
+            time_provider: Box::new(time_provider),
         }));
         let result = get_heartbeat_impl(1, state.lock().unwrap());
         assert_eq!(result, Err(ERROR_CODE_ID_NONEXISTENT));
@@ -302,7 +301,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             expires,
             availables: availables_from_range(3..3),
-            time_provider: &time_provider,
+            time_provider: Box::new(time_provider),
         }));
         let result = get_heartbeat_impl(1, state.lock().unwrap());
         assert_eq!(result, Ok(now + TEST_TIMEOUT + TEST_TIMEOUT / 2));
@@ -322,7 +321,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             expires,
             availables: availables_from_range(2..3),
-            time_provider: &time_provider,
+            time_provider: Box::new(time_provider),
         }));
         let result = get_heartbeat_impl(1, state.lock().unwrap());
         assert_eq!(result, Err(ERROR_CODE_ID_EXPIRED));

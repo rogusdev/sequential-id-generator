@@ -10,7 +10,7 @@ pub trait TimeProvider : DynClone {
 
 clone_trait_object!(TimeProvider); // only needed for Box, not Arc?
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SystemTimeProvider {
 }
 
@@ -27,7 +27,7 @@ impl TimeProvider for SystemTimeProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FixedTimeProvider {
     pub fixed_unix_ts_ms: i64,
 }
@@ -45,7 +45,7 @@ impl TimeProvider for FixedTimeProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ZeroTimeProvider {
 }
 
