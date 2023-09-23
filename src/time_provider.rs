@@ -33,9 +33,18 @@ pub struct FixedTimeProvider {
 }
 
 impl FixedTimeProvider {
-    #[allow(dead_code)]
-    pub fn set_fixed_unix_ts_ms (&mut self, ms: i64) {
+    pub fn new (fixed_unix_ts_ms: i64) -> Self {
+        Self {
+            fixed_unix_ts_ms,
+        }
+    }
+
+    pub fn set (&mut self, ms: i64) {
         self.fixed_unix_ts_ms = ms;
+    }
+
+    pub fn add (&mut self, ms: i64) {
+        self.fixed_unix_ts_ms += ms;
     }
 }
 
@@ -53,4 +62,46 @@ impl TimeProvider for ZeroTimeProvider {
     fn unix_ts_ms (&self) -> i64 {
         0
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    // this is so we can change the contents of the time provider while state continues to hold it
+    impl TimeProvider for Arc<Mutex<FixedTimeProvider>> {
+        fn unix_ts_ms (&self) -> i64 {
+            self.lock().unwrap().fixed_unix_ts_ms
+        }
+    }
+
+    impl FixedTimeProvider {
+        pub fn arc_new (fixed_unix_ts_ms: i64) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(Self {
+                fixed_unix_ts_ms,
+            }))
+        }
+
+        pub fn arc_set (arc: &Arc<Mutex<Self>>, ms: i64) {
+            arc.lock().unwrap().fixed_unix_ts_ms = ms
+        }
+
+        pub fn arc_add (arc: &Arc<Mutex<Self>>, ms: i64) {
+            arc.lock().unwrap().fixed_unix_ts_ms += ms
+        }
+    }
+
+    /*
+    // in a test...
+    let time_provider = FixedTimeProvider::arc_new(123);
+    ...
+    let time_provider_injected = time_provider.clone();  // pass this to an object to own
+    ...
+    // assert before
+    FixedTimeProvider::arc_add(&time_provider, 1000);
+    // assert after
+    ... etc
+    */
 }

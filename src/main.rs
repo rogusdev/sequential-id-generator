@@ -166,17 +166,10 @@ async fn main() {
 mod tests {
     use std::ops::Range;
 
-    use super::*;
+    use crate::*;
     use time_provider::{FixedTimeProvider, ZeroTimeProvider};
 
     const TEST_TIMEOUT: i64 = 2000;
-
-    // this is so we can change the contents of the time provider while state continues to hold it
-    impl TimeProvider for Arc<Mutex<FixedTimeProvider>> {
-        fn unix_ts_ms (&self) -> i64 {
-            self.lock().unwrap().fixed_unix_ts_ms
-        }
-    }
 
     fn vec_to_btree<T: Ord, U> (v: Vec<(T, U)>) -> BTreeMap<T, U> {
         v.into_iter()
@@ -190,9 +183,7 @@ mod tests {
 
     #[test]
     fn get_next_impl_err () {
-        let time_provider = FixedTimeProvider {
-            fixed_unix_ts_ms: 123,
-        };
+        let time_provider = FixedTimeProvider::new(123);
         let now = time_provider.unix_ts_ms();
         let expires = vec_to_btree(vec![
             (1, now + TEST_TIMEOUT),
@@ -210,9 +201,7 @@ mod tests {
 
     #[test]
     fn get_next_impl_ok () {
-        let time_provider = FixedTimeProvider {
-            fixed_unix_ts_ms: 123,
-        };
+        let time_provider = FixedTimeProvider::new(123);
         let now = time_provider.unix_ts_ms();
         let expires = vec_to_btree(vec![
             (1, now + TEST_TIMEOUT),
@@ -230,9 +219,7 @@ mod tests {
 
     #[test]
     fn get_next_impl_expireds () {
-        let time_provider = Arc::new(Mutex::new(FixedTimeProvider {
-            fixed_unix_ts_ms: 123,
-        }));
+        let time_provider = FixedTimeProvider::arc_new(123);
         let now = time_provider.lock().unwrap().unix_ts_ms();
         let expires = vec_to_btree(vec![
             (1, now - TEST_TIMEOUT),
@@ -258,7 +245,7 @@ mod tests {
         }
 
         {
-            time_provider.lock().unwrap().fixed_unix_ts_ms += TEST_TIMEOUT / 2;
+            FixedTimeProvider::arc_add(&time_provider, TEST_TIMEOUT / 2);
             let result = get_next_impl(state.lock().unwrap());
             assert_eq!(result, Ok((3, now + TEST_TIMEOUT / 2 + TEST_TIMEOUT)));
             let result2 = get_next_impl(state.lock().unwrap());
@@ -268,7 +255,7 @@ mod tests {
         }
 
         {
-            time_provider.lock().unwrap().fixed_unix_ts_ms += TEST_TIMEOUT / 2;
+            FixedTimeProvider::arc_add(&time_provider, TEST_TIMEOUT / 2);
             let result = get_next_impl(state.lock().unwrap());
             assert_eq!(result, Ok((2, now + TEST_TIMEOUT + TEST_TIMEOUT)));
         }
@@ -289,15 +276,13 @@ mod tests {
 
     #[test]
     fn get_heartbeat_impl_ok () {
-        let mut time_provider = FixedTimeProvider {
-            fixed_unix_ts_ms: 123,
-        };
+        let mut time_provider = FixedTimeProvider::new(123);
         let now = time_provider.unix_ts_ms();
         let expires = vec_to_btree(vec![
             (1, now + TEST_TIMEOUT),
             (2, now + TEST_TIMEOUT),
         ]);
-        time_provider.fixed_unix_ts_ms += TEST_TIMEOUT / 2;
+        time_provider.add(TEST_TIMEOUT / 2);
         let state = Arc::new(Mutex::new(AppState {
             timeout: TEST_TIMEOUT,
             expires,
@@ -310,14 +295,12 @@ mod tests {
 
     #[test]
     fn get_heartbeat_impl_expired () {
-        let mut time_provider = FixedTimeProvider {
-            fixed_unix_ts_ms: 123,
-        };
+        let mut time_provider = FixedTimeProvider::new(123);
         let now = time_provider.unix_ts_ms();
         let expires = vec_to_btree(vec![
             (1, now + TEST_TIMEOUT),
         ]);
-        time_provider.fixed_unix_ts_ms += TEST_TIMEOUT * 2;
+        time_provider.add(TEST_TIMEOUT * 2);
         let state = Arc::new(Mutex::new(AppState {
             timeout: TEST_TIMEOUT,
             expires,
